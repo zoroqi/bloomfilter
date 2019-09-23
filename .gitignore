@@ -1,9 +1,17 @@
+.idea
+
 # Binaries for programs and plugins
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
+
+# log file and dump file
+*.log
+*.bf
+
+cmd/server/server
 
 # Test binary, build with `go test -c`
 *.test
