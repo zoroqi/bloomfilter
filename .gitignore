@@ -7,6 +7,8 @@
 *.so
 *.dylib
 
+test*
+
 # log file and dump file
 *.log
 *.bf

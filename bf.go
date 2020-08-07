@@ -1,54 +1,34 @@
 package bloomfilter
 
 import (
+	"fmt"
 	gh "github.com/dgryski/go-farm"
-	"github.com/sirupsen/logrus"
+	"io/ioutil"
 	"math"
 	"os"
-	"sync"
+	"strconv"
+	"strings"
 	"sync/atomic"
 )
 
-const FILE_LOG = ".log"
-const FILE_BF = ".bf"
+const FILE_BF_BITEMAP = ".bitmap"
+const FILE_BF_META = ".meta"
 
 type BF struct {
 	bm       *Bitmap
 	BitSize  uint64
 	HashSize int
 	MaxSize  uint64
-	Total    int32
-	Hash     []int
-	append   *appendlog
+	Total    uint64
 }
 
-type appendlog struct {
-	log       *logrus.Logger
-	buffer    chan string
-	dump      bool
-	localPath string
-	logName   string
-	stop      bool
-	stopCh    chan struct{}
-	wait      sync.WaitGroup
-}
-
-func (b *BF) Initialization() (e error) {
-	return b.append.initialization()
-}
-
-func (b *BF) Close() {
-	b.append.close()
-}
-
-func NewBloomFilter(max uint32, fpp float64, path string, isDump bool) *BF {
+func NewBloomFilter(max uint32, fpp float64) *BF {
 	return &BF{
 		bm:       NewBitmap(bitSize(max, fpp)),
 		HashSize: hashNum(max, fpp),
 		BitSize:  bitSize(max, fpp),
 		MaxSize:  uint64(max),
 		Total:    0,
-		append:   &appendlog{buffer: make(chan string, 1024), dump: isDump, localPath: path, logName: "bloomfiler", wait: sync.WaitGroup{}},
 	}
 }
 
@@ -57,7 +37,7 @@ func hash(str string) uint64 {
 }
 
 func bitSize(max uint32, fpp float64) uint64 {
-	return uint64(-(float64(max) * math.Log(fpp))/(math.Log(2)*math.Log(2))) + 1
+	return uint64(-(float64(max)*math.Log(fpp))/(math.Log(2)*math.Log(2))) + 1
 }
 
 func hashNum(max uint32, fpp float64) int {
@@ -65,35 +45,27 @@ func hashNum(max uint32, fpp float64) int {
 }
 
 func (b *BF) Put(str string) bool {
-	r := b.put(str)
-	if !r {
-		b.append.appendBuffer(str)
-	}
-	return r
-}
-
-func (b *BF) put(str string) bool {
 	r := true
 	h1 := hash(str)
 	h2 := hash(str + str)
 	for i := 0; i < b.HashSize; i++ {
-		c := uint64(h1 + uint64(i)*h2)
+		c := h1 + uint64(i)*h2
 		r = b.bm.Set(c%b.bm.maxSize) && r
 	}
 
 	if !r {
-		atomic.AddInt32(&b.Total, 1)
+		atomic.AddUint64(&b.Total, 1)
 	}
 	return r
 }
 
-func (b *BF) Exist(str string) bool {
+func (b *BF) Contains(str string) bool {
 	r := true
 	h1 := hash(str)
 	h2 := hash(str + str)
 	for i := 0; i < b.HashSize; i++ {
-		c := uint64(h1 + uint64(i)*h2)
-		r = r && b.bm.Exist(c%b.bm.maxSize)
+		c := h1 + uint64(i)*h2
+		r = r && b.bm.Get(c%b.bm.maxSize)
 		if !r {
 			return r
 		}
@@ -101,64 +73,89 @@ func (b *BF) Exist(str string) bool {
 	return r
 }
 
-func (b *appendlog) initialization() (e error) {
-	b.wait.Add(1)
-	b.stopCh = make(chan struct{})
-	f, err := os.OpenFile(b.localPath+b.logName+FILE_LOG, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0666)
+func LoadBF(path string, name string) (*BF, error) {
+	metaPath := path + "/" + name + FILE_BF_META
+	meta, err := ioutil.ReadFile(metaPath)
 	if err != nil {
-		e = err
-		return
+		return nil, err
 	}
-	b.log = logrus.New()
-	b.log.SetOutput(f)
-	b.log.SetNoLock()
-	b.log.SetFormatter(&logrus.TextFormatter{})
-
-	b.asyncWriteLog()
-
-	// 停止监听, 关闭文件和等待buffer消费完毕
-	go func() {
-		defer b.wait.Done()
-		defer f.Close()
-		_ = <-b.stopCh
-		for s := range b.buffer {
-			if s != "" {
-				b.log.Infof("%s", s)
-			}
-		}
-	}()
-	return
-}
-
-func (b *appendlog) asyncWriteLog() {
-	writeOnce := sync.Once{}
-	writeOnce.Do(func() {
-		go func(ch chan string, logger *logrus.Logger) {
-			for {
-				select {
-				case s, open := <-ch:
-					if open {
-						if s != "" {
-							logger.Infof("%s", s)
-						}
-					} else {
-						break
-					}
-				}
-			}
-		}(b.buffer, b.log)
-	})
-}
-
-func (b *appendlog) close() {
-	b.stop = true
-	close(b.buffer)
-	close(b.stopCh)
-	b.wait.Wait()
-}
-
-func (b *appendlog) appendBuffer(str string) {
-	if b.dump && !b.stop {
-		b.buffer <- str
+	bf, err := parseMeta(string(meta))
+	if err != nil {
+		return nil, err
 	}
+
+	bitPath := path + "/" + name + FILE_BF_BITEMAP
+	bitFile, err := os.OpenFile(bitPath, os.O_RDONLY|os.O_SYNC, 0666)
+	if err != nil {
+		return nil, err
+	}
+	defer bitFile.Close()
+	bitFileInfo, err := bitFile.Stat()
+	if err != nil {
+		return nil, err
+	}
+	bm, err := LoadBitMap(bitFile, bitFileInfo.Size())
+	if err != nil {
+		return nil, err
+	}
+	bf.bm = bm
+	return bf, nil
+}
+
+func parseMeta(meta string) (*BF, error) {
+	ss := strings.Split(meta, ":")
+	if len(ss) != 4 {
+		return nil, fmt.Errorf("meta loss field")
+	}
+	bf := &BF{}
+	var err error
+	bf.MaxSize, err = strconv.ParseUint(ss[0], 10, 0)
+	if err != nil {
+		return nil, fmt.Errorf("MaxSize %w", err)
+	}
+	bf.HashSize, err = strconv.Atoi(ss[1])
+	if err != nil {
+		return nil, fmt.Errorf("HashSize %w", err)
+	}
+	bf.BitSize, err = strconv.ParseUint(ss[2], 10, 0)
+	if err != nil {
+		return nil, fmt.Errorf("BitSize %w", err)
+	}
+	bf.Total, err = strconv.ParseUint(ss[3], 10, 0)
+	if err != nil {
+		return nil, fmt.Errorf("Total %w", err)
+	}
+	return bf, nil
+}
+
+func (b *BF) meta() string {
+	return fmt.Sprintf("%d:%d:%d:%d", b.MaxSize, b.HashSize, b.BitSize, b.Total)
+}
+
+func (b *BF) Dump(path string, name string) error {
+	bitPath := path + "/" + name + FILE_BF_BITEMAP
+	metaPath := path + "/" + name + FILE_BF_META
+	metaPathTemp := metaPath + ".temp"
+	bitPathTemp := bitPath + ".temp"
+
+	bitFile, err := os.OpenFile(bitPathTemp, os.O_RDWR|os.O_CREATE|os.O_SYNC|os.O_TRUNC, 0666)
+	if err != nil {
+		return err
+	}
+	defer bitFile.Close()
+	metaFile, err := os.OpenFile(metaPathTemp, os.O_RDWR|os.O_CREATE|os.O_SYNC|os.O_TRUNC, 0666)
+	if err != nil {
+		return err
+	}
+	defer metaFile.Close()
+	b.bm.Dump(bitFile)
+	metaFile.Write([]byte(b.meta()))
+
+	if err = os.Rename(metaPathTemp, metaPath); err != nil {
+		return err
+	}
+	if err = os.Rename(bitPathTemp, bitPath); err != nil {
+		return err
+	}
+	return nil
 }

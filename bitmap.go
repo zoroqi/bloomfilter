@@ -10,7 +10,7 @@ import (
 )
 
 type Bitmap struct {
-	bits    []uint32
+	bits    []uint32 //选择无符号整形的原因是, atomic不支持byte.
 	maxSize uint64
 }
 
@@ -20,6 +20,7 @@ const (
 
 // 静态添加使用
 var as []uint32
+
 // 静态移除使用
 var rs []uint32
 
@@ -43,16 +44,22 @@ func NewBitmap(size uint64) *Bitmap {
 	return &Bitmap{bits: make([]uint32, s), maxSize: s * unit}
 }
 
-func LoadFile(read io.Reader) (*Bitmap, error) {
-	bits, err := load(read)
+func LoadBitMap(read io.Reader, totalSize int64) (*Bitmap, error) {
+	bits, err := load(read, totalSize)
 	if err != nil {
 		return nil, err
 	}
 	return &Bitmap{bits: bits, maxSize: uint64(len(bits) * unit)}, nil
 }
 
-func load(read io.Reader) ([]uint32, error) {
-	r := make([]uint32, 0, 1024)
+func load(read io.Reader, totalSize int64) ([]uint32, error) {
+	var size int64
+	if totalSize >= 256 {
+		size = size/4 + 1
+	} else {
+		size = 1024
+	}
+	r := make([]uint32, 0, size)
 	bs := make([]byte, 1024)
 	for {
 		n, err := read.Read(bs)
@@ -62,11 +69,11 @@ func load(read io.Reader) ([]uint32, error) {
 		if n == 0 {
 			break
 		}
-		num := n/4
-		for i := 0; i < num; i++ {
+		// 最后不足4byte的部分丢弃. 自身dump是可以保证数据是4的整数倍
+		num := (n / 4) * 4
+		for i := 0; i < num; i += 4 {
 			r = append(r, binary.BigEndian.Uint32(bs[i:i+4]))
 		}
-
 	}
 	return r, nil
 }
@@ -77,7 +84,7 @@ func (b *Bitmap) verifyLength(site uint64) {
 	}
 }
 
-// return true:before value 1, false before 0
+// return true:before value 1, false before value 0
 func (b *Bitmap) Set(index uint64) bool {
 	b.verifyLength(index)
 	bucket := index / unit
@@ -95,13 +102,15 @@ func (b *Bitmap) Set(index uint64) bool {
 	}
 }
 
-// return true:value 1, before 0
-func (b *Bitmap) Exist(index uint64) bool {
+// return true:before value 1, false before value 0
+func (b *Bitmap) Get(index uint64) bool {
 	b.verifyLength(index)
-	return atomic.LoadUint32(&b.bits[index/unit])&as[index%unit] == as[index%unit]
+	bucket := index / unit
+	s := index % unit
+	return atomic.LoadUint32(&b.bits[bucket])&as[s] == as[s]
 }
 
-// return true:before value 1, false before 0
+// return true:before value 1, false before value 0
 func (b *Bitmap) Remove(index uint64) bool {
 	b.verifyLength(index)
 	bucket := index / unit
@@ -118,6 +127,7 @@ func (b *Bitmap) Remove(index uint64) bool {
 	}
 }
 
+// 线程不安全的, 需要和Set,Get,Remove进行额外同步.
 func (b *Bitmap) Dump(w io.Writer) error {
 	return dump(w, b.bits)
 }
@@ -137,19 +147,25 @@ func dump(w io.Writer, bits []uint32) error {
 			bs = bs[0 : (length-i)*4]
 		}
 		i = i + 256
-		w.Write(bs)
+		_, err := w.Write(bs)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-func (b *Bitmap) Print() {
+// 测试使用, 打印内容
+func (b *Bitmap) debugPrint() {
 	s := "%4d ~%4d:%0" + strconv.Itoa(unit) + "b\n"
 	for i, v := range b.bits {
 		n := i % unit
 		if n == 0 {
 			fmt.Printf("----- %d -----\n", i*unit)
 		}
-		fmt.Printf(s, (n+1)*unit-1, n*unit, v)
+		if v != 0 {
+			fmt.Printf(s, (n+1)*unit-1, n*unit, v)
+		}
 	}
 }
 
